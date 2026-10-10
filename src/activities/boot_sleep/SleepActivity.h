@@ -5,8 +5,12 @@ class Bitmap;
 
 class SleepActivity final : public Activity {
  public:
-  explicit SleepActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool fromTimeout = false)
-      : Activity("Sleep", renderer, mappedInput), fromTimeout(fromTimeout) {}
+  explicit SleepActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool fromTimeout = false,
+                         bool showEnteringSleepPopup = true, bool renderSleepScreen = true)
+      : Activity("Sleep", renderer, mappedInput),
+        fromTimeout(fromTimeout),
+        showEnteringSleepPopup(showEnteringSleepPopup),
+        renderSleepScreen(renderSleepScreen) {}
   void onEnter() override;
 
  private:
@@ -18,4 +22,6 @@ class SleepActivity final : public Activity {
   void renderBlankSleepScreen() const;
 
   bool fromTimeout = false;
+  bool showEnteringSleepPopup = true;
+  bool renderSleepScreen = true;
 };

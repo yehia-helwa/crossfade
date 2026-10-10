@@ -4,6 +4,16 @@ A personal fork of [CrossPoint](https://github.com/crosspoint-reader/crosspoint-
 
 CrossFade keeps CrossPoint's on-disk format and MIT license, and merges the latest stable updates from CrossPoint 1.5.0. A handful of v1.3.0's features are adapted from [CrossInk](https://github.com/uxjulia/CrossInk), also a CrossPoint fork and also MIT-licensed — see [Credit](#credit).
 
+## X3 KOReader sync changes in this fork
+
+This fork adds an X3 sync gesture for sharing EPUB reading progress with KOReader through a compatible progress-sync server. Hold **Power + the right-side button** for the normal power-button hold duration to sync the last open book, whether the X3 is awake or showing its sleep screen. The device immediately shows “Syncing,” then reports whether it uploaded, pulled, already matched the server, was ahead, or failed, including the book percentage when available. It returns to the normal sleep screen afterward.
+
+The sync compares local and remote progress and keeps the further position. It uses one Wi-Fi connection and one remote lookup for the on-demand action; normal sleep still pushes progress, while ordinary wake resumes quickly without waiting for a network pull. KOReader and this firmware must use the same sync account and document-matching method for the same EPUB. Personal Wi-Fi and sync credentials live in device settings and are not part of this repository.
+
+To build this variant, clone with submodules and run `pio run -e slim`. The resulting firmware is `.pio/build/slim/firmware.bin`. The Releases link below points to the original CrossFade releases, which do not include this fork's sync gesture.
+
+These changes build on [Chuckthe5th's CrossFade](https://github.com/Chuckthe5th/crossfade), itself based on [CrossPoint](https://github.com/crosspoint-reader/crosspoint-reader). The rest of this README describes the upstream CrossFade project.
+
 ---
 
 ## ⚠️ Read this before flashing

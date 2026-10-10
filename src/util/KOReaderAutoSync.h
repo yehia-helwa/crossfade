@@ -19,19 +19,35 @@ class GfxRenderer;
 //    remote's. See lib/KOReaderSync/ProgressMapper.h.
 namespace KOReaderAutoSync {
 
-// Call from main.cpp's enterDeepSleep(), after the sleep screen is already painted (so there's no
-// visible indication anything is happening) and before its existing WiFi teardown -- this function
-// manages the radio's on/off lifecycle itself, so that teardown is a harmless no-op afterward.
-// Pushes APP_STATE.openEpubPath's current local progress if it's ahead of the server's; no-ops
-// entirely unless APP_STATE.lastSleepFromReader is true.
-void pushOnSleep();
+enum class Status { Skipped, UpToDate, Uploaded, Downloaded, Failed };
+struct Result {
+  Status status;
+  float percentage = 0.0f;
+  bool matchesRemote = false;
+};
 
-// Call when a book is freshly opened from a browsing screen (Home/Covers/Titles) -- NOT on
-// boot-resume or quick-resume-from-sleep, where this would defeat the point of "quick." Pulls the
+// Call from main.cpp's enterDeepSleep(), after the sleep screen is already painted, or from an
+// explicit sync wake. This function manages the radio's on/off lifecycle itself.
+// Pushes APP_STATE.openEpubPath's current local progress if it's ahead of the server's; no-ops
+// entirely unless APP_STATE.lastSleepFromReader is true. An explicit sync wake
+// may also push the last open book when sleep was entered from Home.
+Result pushOnSleep(bool explicitRequest = false);
+// True once if Power + X3 right-side button was observed while the sleep push
+// was polling the network. Lets the sleep path honor a gesture released before
+// the network call returns.
+bool takeSleepComboObserved();
+
+// Call when a book is freshly opened from a browsing screen (Home/Covers/Titles), or during an
+// explicit sync wake. Pulls the
 // server's progress for epubPath and, if it's further than local, writes it into progress.bin
 // before the caller constructs the reader activity, so EpubReaderActivity's own
 // EpubReaderUtils::loadProgress() picks it up with no changes on its side. Only applies to EPUB
 // files (matching the manual sync feature's own scope); a no-op for any other extension.
-void pullFurthestOnOpen(const std::string& epubPath, GfxRenderer& renderer);
+Result pullFurthestOnOpen(const std::string& epubPath, GfxRenderer& renderer);
+
+// Explicit sleep-button sync: compare the current book once, then upload or
+// download whichever position is further. Uses one WiFi association and one
+// remote GET instead of running the separate push and pull paths back-to-back.
+Result syncOnDemand(const std::string& epubPath, GfxRenderer& renderer);
 
 }  // namespace KOReaderAutoSync

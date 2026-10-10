@@ -18,6 +18,7 @@
 #include <builtinFonts/all.h>
 #include <esp_ota_ops.h>
 
+#include <cstdio>
 #include <cstring>
 
 #include "CrossPointSettings.h"
@@ -177,6 +178,7 @@ void silentRestartToReader() {
   ESP.restart();
 }
 
+// The wake press must be released before an awake sync gesture can be armed.
 void waitForPowerRelease() {
   gpio.update();
   while (gpio.isPressed(HalGPIO::BTN_POWER)) {
@@ -208,6 +210,21 @@ static bool loadSleepFrameBuffer() {
   return true;
 }
 
+void runButtonSyncAndSleep(bool fromSleep);
+
+// A sleep wallpaper can be visible several seconds before WiFi and the SD/panel
+// shutdown finish. A combo pressed in that interval is still an awake input:
+// waiting for Power to be released before deep sleep would otherwise swallow it.
+static bool handleComboDuringSleepPreparation(bool previouslyObserved = false) {
+  if (!gpio.deviceIsX3()) return false;
+  gpio.update();
+  delay(10);  // pass the input manager's debounce interval
+  gpio.update();
+  if (!previouslyObserved && (!gpio.isPressed(HalGPIO::BTN_POWER) || !gpio.isPressed(HalGPIO::BTN_DOWN))) return false;
+  runButtonSyncAndSleep(true);
+  return true;
+}
+
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
@@ -233,6 +250,8 @@ void enterDeepSleep(bool fromTimeout = false) {
   // press either way, and manages its own WiFi lifecycle -- see KOReaderAutoSync::pushOnSleep().
   KOReaderAutoSync::pushOnSleep();
 
+  if (handleComboDuringSleepPreparation(KOReaderAutoSync::takeSleepComboObserved())) return;
+
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep. Wake from deep
   // sleep is effectively a chip reset, so no state needs to survive. Usually a no-op by this point
   // -- pushOnSleep() already disconnects on every exit path -- but stays as a hard guarantee this
@@ -241,6 +260,8 @@ void enterDeepSleep(bool fromTimeout = false) {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
   }
+
+  if (handleComboDuringSleepPreparation()) return;
 
   halTiltSensor.deepSleep();
   display.deepSleep();
@@ -292,10 +313,97 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
 
-  // Discover and load SD card fonts
   sdFontSystem.begin(renderer);
 
   LOG_DBG("MAIN", "Fonts setup");
+}
+
+void runButtonSyncAndSleep(bool fromSleep) {
+  if (!fromSleep) APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  APP_STATE.showBootScreen = true;
+  APP_STATE.saveToFile();
+  deepSleepInProgress = true;
+  // Drop the active reader to release its EPUB/section memory for TLS. Its
+  // visible page already saved progress when rendered. Defer the wallpaper
+  // until after the sync result so acknowledgment appears immediately.
+  if (!fromSleep) activityManager.goToSleep(false, false, false);
+
+  // The first wake paint uses an absolute refresh from a known black frame.
+  if (fromSleep) {
+    renderer.clearScreen(0x00);
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  }
+
+  // The panel is already awake and initialized; show feedback before WiFi.
+  const bool hasBook = !APP_STATE.openEpubPath.empty();
+  const bool canSync = hasBook && KOREADER_STORE.getAutoSyncEnabled();
+  renderer.clearScreen();
+  GUI.drawPopup(renderer, !hasBook ? "No book to sync" : !canSync ? "Sync disabled" : "Syncing... let go");
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  const unsigned long acknowledgedAt = millis();
+
+  // Start on the hold threshold; releasing the buttons is not the trigger.
+  const auto synced = canSync ? KOReaderAutoSync::syncOnDemand(APP_STATE.openEpubPath, renderer)
+                              : KOReaderAutoSync::Result{KOReaderAutoSync::Status::Skipped};
+  LOG_DBG("MAIN", "Button-combo sync finished (status=%d, percentage=%.4f)", static_cast<int>(synced.status),
+          synced.percentage * 100.0f);
+
+  // Even a skipped/failed sync must leave its acknowledgment on the e-ink
+  // panel long enough to read. This delay comes after the network request,
+  // so a real sync still starts as soon as the hold is recognized.
+  while (millis() - acknowledgedAt < 700) delay(20);
+  if (canSync) {
+    char resultMessage[48];
+    using KOReaderAutoSync::Status;
+    switch (synced.status) {
+      case Status::Uploaded:
+        snprintf(resultMessage, sizeof(resultMessage), "Uploaded %.1f%%", synced.percentage * 100.0f);
+        break;
+      case Status::Downloaded:
+        snprintf(resultMessage, sizeof(resultMessage), "Pulled %.1f%%", synced.percentage * 100.0f);
+        break;
+      case Status::UpToDate:
+        snprintf(resultMessage, sizeof(resultMessage), "%s %.1f%%",
+                 synced.matchesRemote ? "Matches server" : "Already ahead", synced.percentage * 100.0f);
+        break;
+      case Status::Skipped:
+        snprintf(resultMessage, sizeof(resultMessage), "Sync unavailable");
+        break;
+      case Status::Failed:
+        snprintf(resultMessage, sizeof(resultMessage), "Sync failed");
+        break;
+    }
+    std::string bookName = APP_STATE.openEpubPath;
+    const auto slash = bookName.rfind('/');
+    if (slash != std::string::npos) bookName.erase(0, slash + 1);
+    const auto authorSeparator = bookName.find(" - ");
+    if (authorSeparator != std::string::npos) bookName.resize(authorSeparator);
+    if (bookName.size() > 24) bookName.resize(24);
+    renderer.clearScreen();
+    renderer.drawCenteredText(UI_12_FONT_ID, renderer.getScreenHeight() / 2 - 16, bookName.c_str(), true,
+                              EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_12_FONT_ID, renderer.getScreenHeight() / 2 + 14, resultMessage);
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    delay(1400);
+  } else {
+    while (millis() - acknowledgedAt < 1600) delay(20);
+  }
+
+  // Render the normal sleep wallpaper once and suppress SleepActivity's
+  // generic "Going to sleep" popup, which obscured the sync result.
+  deepSleepInProgress = true;
+  activityManager.goToSleep(false, false);
+
+  // E-ink keeps the normal sleep wallpaper visible during deep sleep.
+  if (WiFi.getMode() != WIFI_MODE_NULL) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+  halTiltSensor.deepSleep();
+  display.deepSleep();
+  Storage.end();
+  powerManager.startDeepSleep(gpio);
+  return;
 }
 
 void setup() {
@@ -386,6 +494,7 @@ void setup() {
   // boot to skip directly to the SD-card firmware update screen. Useful on devices where USB
   // flashing has been locked down (e.g. recent X3 firmware).
   bool recoveryFirmwareMode = false;
+  bool sleepSyncCombo = false;
   if (wakeupReason == HalGPIO::WakeupReason::PowerButton) {
     // Refresh the cached button state a few times — isPressed() needs ~half a second to settle
     // after boot per the HalGPIO contract. Use a millis-based deadline so we always wait the full
@@ -398,6 +507,8 @@ void setup() {
     if (gpio.isPressed(HalGPIO::BTN_UP)) {
       recoveryFirmwareMode = true;
       LOG_INF("MAIN", "Recovery firmware mode (UP + POWER held at boot)");
+    } else if (gpio.deviceIsX3() && gpio.isPressed(HalGPIO::BTN_DOWN)) {
+      sleepSyncCombo = true;
     }
   }
 
@@ -413,7 +524,11 @@ void setup() {
                                                         : BootResume::Splash;
   bool allowFastInitialReaderRefresh = false;
 
-  setupDisplayAndFonts(resume != BootResume::Splash);
+  setupDisplayAndFonts(sleepSyncCombo || resume != BootResume::Splash);
+  if (sleepSyncCombo) {
+    runButtonSyncAndSleep(true);
+    return;
+  }
 
   switch (resume) {
     case BootResume::Silent:
@@ -477,6 +592,10 @@ void setup() {
     APP_STATE.openEpubPath = "";
     APP_STATE.readerActivityLoadCount++;
     APP_STATE.saveToFile();
+    // Resume directly from the saved position. A network pull here blocks the
+    // first page on WiFi and TLS, making every wake feel slow. The reader's
+    // manual sync shortcut (long-press Confirm) still pulls on demand; the
+    // sleep path continues to push progress automatically.
     activityManager.goToReader(path, allowFastInitialReaderRefresh);
   }
 
@@ -528,9 +647,11 @@ void setup() {
 }
 
 void loop() {
+#ifdef ENABLE_SERIAL_LOG
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
+#endif
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
   gpio.update();
@@ -538,6 +659,7 @@ void loop() {
 
   renderer.setFadingFix(SETTINGS.fadingFix);
 
+#ifdef ENABLE_SERIAL_LOG
   if (Serial && millis() - lastMemPrint >= 10000) {
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),
             ESP.getHeapSize(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
@@ -560,6 +682,7 @@ void loop() {
       }
     }
   }
+#endif
 
   // Check for any user activity (button press or release) or active background work
   static unsigned long lastActivityTime = millis();
@@ -571,7 +694,19 @@ void loop() {
 
   static bool screenshotButtonsReleased = true;
   static bool screenshotComboActive = false;
+  static bool x3AwakeSyncArmed = false;
+  if (gpio.deviceIsX3() && !gpio.isPressed(HalGPIO::BTN_POWER) && !gpio.isPressed(HalGPIO::BTN_DOWN)) {
+    x3AwakeSyncArmed = true;
+  }
   if (gpio.isPressed(HalGPIO::BTN_POWER) && gpio.isPressed(HalGPIO::BTN_DOWN)) {
+    if (gpio.deviceIsX3()) {
+      // Require a separate, completed wake first. A combo held through boot
+      // cannot launch sync; an awake hold uses the normal power-button time.
+      if (x3AwakeSyncArmed && gpio.getPowerButtonHeldTime() >= SETTINGS.getPowerButtonDuration()) {
+        runButtonSyncAndSleep(false);
+      }
+      return;
+    }
     screenshotComboActive = true;
     if (screenshotButtonsReleased) {
       screenshotButtonsReleased = false;
@@ -603,7 +738,7 @@ void loop() {
 
   if (millis() >= allowSleepAt && gpio.isPressed(HalGPIO::BTN_POWER) &&
       gpio.getPowerButtonHeldTime() > SETTINGS.getPowerButtonDuration()) {
-    // If the screenshot combination is potentially being pressed, don't sleep
+    // The Power + side-button combination has its own handler above.
     if (gpio.isPressed(HalGPIO::BTN_DOWN)) {
       return;
     }
@@ -628,8 +763,11 @@ void loop() {
     activityManager.requestUpdate();
   }
 
+#ifdef ENABLE_SERIAL_LOG
   const unsigned long activityStartTime = millis();
+#endif
   activityManager.loop();
+#ifdef ENABLE_SERIAL_LOG
   const unsigned long activityDuration = millis() - activityStartTime;
 
   const unsigned long loopDuration = millis() - loopStartTime;
@@ -639,6 +777,7 @@ void loop() {
       LOG_DBG("LOOP", "New max loop duration: %lu ms (activity: %lu ms)", maxLoopDuration, activityDuration);
     }
   }
+#endif
 
   // Add delay at the end of the loop to prevent tight spinning
   // When an activity requests skip loop delay (e.g., webserver running), use yield() for faster response

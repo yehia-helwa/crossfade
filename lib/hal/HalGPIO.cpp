@@ -326,6 +326,14 @@ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
       (wakeupCause == ESP_SLEEP_WAKEUP_GPIO || wakeupCause == ESP_SLEEP_WAKEUP_EXT1)) {
     return WakeupReason::PowerButton;
   }
+  // On X3, charging-current inference can be stale around a cold power-on.
+  // A physically held Power button is an intentional wake even if the gauge
+  // briefly reports positive current.
+  if (deviceIsX3() && resetReason == ESP_RST_POWERON &&
+      digitalRead(BoardConfig::ACTIVE.input.power) ==
+          (BoardConfig::ACTIVE.input.powerActiveHigh ? HIGH : LOW)) {
+    return WakeupReason::PowerButton;
+  }
   if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected) {
     return WakeupReason::PowerButton;
   }
